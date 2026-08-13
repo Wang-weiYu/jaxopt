@@ -221,6 +221,8 @@ class LbfgsbState(NamedTuple):
   num_fun_eval: int = 0
   num_grad_eval: int = 0
   num_linesearch_iter: int = 0
+  stall_count: int = 0
+  stalled: bool = False
 
 
 @dataclasses.dataclass(eq=False)
@@ -273,8 +275,14 @@ class LBFGSB(base.IterativeSolver):
     implicit_diff_solve: the linear system solver to use.
     jit: whether to JIT-compile the optimization loop (default: True).
     unroll: whether to unroll the optimization loop (default: "auto").
-    verbose: if set to True or 1 prints the information at each step of 
+    verbose: if set to True or 1 prints the information at each step of
       the solver, if set to 2, print also the information of the linesearch.
+    stall_iterations: number of consecutive insignificant objective changes
+      before declaring a stall. Zero (default) disables stall detection.
+    stall_tol: absolute objective-change threshold used by stall detection.
+    stall_rtol: relative objective-change threshold used by stall detection.
+    stop_if_stalled: whether to terminate when a stall is detected. Detection
+      information is stored in state and printed once via ``jax.debug.print``.
   """
 
   fun: Callable  # pylint: disable=g-bare-generic
@@ -308,12 +316,19 @@ class LBFGSB(base.IterativeSolver):
 
   verbose: Union[bool, int] = False
 
+  stall_iterations: int = 0
+  stall_tol: float = 0.0
+  stall_rtol: float = 0.0
+  stop_if_stalled: bool = True
+
   def _cond_fun(self, inputs):
     _, state = inputs[0]
     # We continue the optimization loop while the error tolerance is not met
     # and either failed linesearch is disallowed or linesearch hasn't failed.
-    return (state.error > self.tol) & jnp.logical_or(
-        not self.stop_if_linesearch_fails, ~state.failed_linesearch)
+    return ((state.error > self.tol)
+            & jnp.logical_or(not self.stop_if_linesearch_fails,
+                             ~state.failed_linesearch)
+            & jnp.logical_or(not self.stop_if_stalled, ~state.stalled))
 
   def init_state(
       self,
@@ -372,7 +387,9 @@ class LBFGSB(base.IterativeSolver):
         failed_linesearch=jnp.asarray(False),
         num_fun_eval=jnp.array(1, base.NUM_EVAL_DTYPE),
         num_grad_eval=jnp.array(1, base.NUM_EVAL_DTYPE),
-        num_linesearch_iter=np.array(0, base.NUM_EVAL_DTYPE)
+        num_linesearch_iter=np.array(0, base.NUM_EVAL_DTYPE),
+        stall_count=jnp.asarray(0),
+        stalled=jnp.asarray(False),
     )
 
   def update(
@@ -539,6 +556,28 @@ class LBFGSB(base.IterativeSolver):
     )
 
     error = _get_error(new_params, new_grad, lower, upper)
+
+    # Keep stall bookkeeping on device so the compiled optimization loop is not
+    # broken. Only the diagnostic print is a host callback, and it runs once.
+    objective_change = jnp.abs(new_value - state.value)
+    stall_threshold = self.stall_tol + self.stall_rtol * jnp.abs(state.value)
+    insignificant_change = objective_change <= stall_threshold
+    stall_count = jnp.where(insignificant_change, state.stall_count + 1, 0)
+    stall_enabled = self.stall_iterations > 0
+    stalled = stall_enabled & (stall_count >= self.stall_iterations)
+    just_stalled = stalled & ~state.stalled
+
+    def _print_stall(_):
+      jax.debug.print(
+          "WARNING: jaxopt.LBFGSB stalled at iter {i}: objective={v}, "
+          "objective_change={d}, projected_gradient_norm={e}, stepsize={s}, "
+          "consecutive_insignificant_steps={n}",
+          i=state.iter_num + 1, v=new_value, d=objective_change, e=error,
+          s=new_stepsize, n=stall_count, ordered=True)
+      return jnp.asarray(0)
+
+    jax.lax.cond(just_stalled, _print_stall, lambda _: jnp.asarray(0), operand=0)
+
     new_state = LbfgsbState(
         iter_num=state.iter_num + 1,
         value=new_value,
@@ -554,6 +593,8 @@ class LBFGSB(base.IterativeSolver):
         num_grad_eval=new_num_grad_eval,
         num_fun_eval=new_num_fun_eval,
         num_linesearch_iter=new_num_linesearch_iter,
+        stall_count=stall_count,
+        stalled=stalled,
     )
 
     if self.verbose:
@@ -590,6 +631,10 @@ class LBFGSB(base.IterativeSolver):
     return self._value_and_grad_fun(params, *args, **kwargs)[1]
 
   def __post_init__(self):
+    if self.stall_iterations < 0:
+      raise ValueError("stall_iterations must be non-negative")
+    if self.stall_tol < 0 or self.stall_rtol < 0:
+      raise ValueError("stall tolerances must be non-negative")
     super().__post_init__()
 
     _fun_with_aux, _, self._value_and_grad_with_aux = base._make_funs_with_aux(
