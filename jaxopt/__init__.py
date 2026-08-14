@@ -49,6 +49,8 @@ from jaxopt._src.osqp import OSQP
 from jaxopt._src.polyak_sgd import PolyakSGD
 from jaxopt._src.projected_gradient import ProjectedGradient
 from jaxopt._src.proximal_gradient import ProximalGradient
+from jaxopt._src.restart import RestartResult
+from jaxopt._src.restart import run_with_stall_restarts
 from jaxopt._src.scipy_wrappers import ScipyBoundedLeastSquares
 from jaxopt._src.scipy_wrappers import ScipyBoundedMinimize
 from jaxopt._src.scipy_wrappers import ScipyLeastSquares
