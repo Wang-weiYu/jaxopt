@@ -35,29 +35,36 @@ def run_with_stall_restarts(solver, initial_params, bounds, *args,
                             max_restarts=3, first_seed=0, **kwargs):
   """Run LBFGSB and randomly restart it whenever it reports a stall.
 
-  The best solution by objective value is returned. ``seeds_used`` counts only
-  random restarts; the supplied initial parameters do not consume a seed.
-  Seeds are the consecutive integers ``first_seed, first_seed + 1, ...``.
+  A converged solution is always preferred over stalled solutions. If every
+  attempt stalls, the stalled solution with the best objective is returned.
+  ``seeds_used`` counts only random restarts; the supplied initial parameters
+  do not consume a seed. ``last_seed`` is the seed of the returned solution,
+  or ``None`` when the returned solution used ``initial_params``. Seeds are
+  consecutive integers beginning with ``first_seed``.
   """
   if max_restarts < 0:
     raise ValueError("max_restarts must be non-negative")
 
   params = initial_params
   best = None
+  best_seed = None
+  current_seed = None
   seeds_used = 0
-  last_seed = None
 
   for attempt in range(max_restarts + 1):
     solution = solver.run(params, bounds, *args, **kwargs)
     jax.block_until_ready(solution.params)
     if best is None or float(solution.state.value) < float(best.state.value):
       best = solution
+      best_seed = current_seed
 
-    if not bool(solution.state.stalled) or attempt == max_restarts:
-      return RestartResult(best, seeds_used, last_seed, attempt + 1)
+    if not bool(solution.state.stalled):
+      return RestartResult(solution, seeds_used, current_seed, attempt + 1)
+    if attempt == max_restarts:
+      return RestartResult(best, seeds_used, best_seed, attempt + 1)
 
-    last_seed = first_seed + seeds_used
-    key = jax.random.PRNGKey(last_seed)
+    current_seed = first_seed + seeds_used
+    key = jax.random.PRNGKey(current_seed)
     params = _random_in_bounds(key, *bounds)
     seeds_used += 1
 
