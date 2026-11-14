@@ -176,7 +176,8 @@ def _find_cauchy_point(
 
 
 def _minimize_subspace(
-    x, grad, lower, upper, x_cauchy, c, theta, w, m, active_set_mask
+    x, grad, lower, upper, x_cauchy, c, theta, w, m, active_set_mask,
+    m_inv=None,
 ):
   """Direct primal method of subspace minimization from [1]."""
   w_masked = w * active_set_mask[:, jnp.newaxis].astype(w.dtype)
@@ -186,11 +187,14 @@ def _minimize_subspace(
 
   # TODO(emilyaf): Implement the method from [1] for a large number of variables
   # and few active constraints.
-  v = jnp.dot(w_masked.T, r_c)
-  v = jnp.matmul(m, v)
-  n = jnp.matmul(w_masked.T, w_masked) / theta
-  n = jnp.eye(m.shape[-1], dtype=w.dtype) - jnp.matmul(m, n)
-  v = jnp.linalg.solve(n, v)
+  # (I - M A) v = M b is equivalent to (M^{-1} - A) v = b.
+  # Use the latter without explicitly left-preconditioning by M: forming
+  # I - M A can amplify inversion error and destroy a descent direction.
+  # update() supplies the original compact matrix, before inversion.
+  if m_inv is None:
+    m_inv = jnp.linalg.inv(m)
+  n = m_inv - jnp.matmul(w_masked.T, w_masked) / theta
+  v = jnp.linalg.solve(n, jnp.dot(w_masked.T, r_c))
   du = -r_c / theta - jnp.matmul(w_masked, v) / theta**2
 
   # TODO(emilyaf, srvasude): Investigate whether to instead truncate
@@ -254,6 +258,10 @@ class LBFGSB(base.IterativeSolver):
       iteration.
     stop_if_linesearch_fails: whether to stop iterations if the line search
       fails. When True, this matches the behavior of core JAX.
+    reset_if_linesearch_fails: whether to discard curvature history after a
+      failed line search. Default False preserves the existing recovery policy;
+      set True to retry the next iteration with a fresh model. This has no
+      effect if stop_if_linesearch_fails terminates the solve.
     condition: Deprecated. Condition used to select the stepsize when using
       backtracking linesearch
     maxls: maximum number of iterations to use in the line search.
@@ -307,6 +315,8 @@ class LBFGSB(base.IterativeSolver):
   unroll: base.AutoOrBoolean = "auto"
 
   verbose: Union[bool, int] = False
+  # Append new options to preserve the positional constructor signature.
+  reset_if_linesearch_fails: bool = False
 
   def _cond_fun(self, inputs):
     _, state = inputs[0]
@@ -408,6 +418,15 @@ class LBFGSB(base.IterativeSolver):
     s_history_flat = _flatten_and_concat(state.s_history, batch_ndims=1)
     y_history_flat = _flatten_and_concat(state.y_history, batch_ndims=1)
 
+    # The compact formula's triangular factor depends on chronological order,
+    # not physical circular-buffer order. Keep the stored histories unchanged
+    # so insertion and warm-start semantics remain the same.
+    oldest = jnp.where(state.num_updates >= self.history_size,
+                       state.num_updates % self.history_size, 0)
+    order = (jnp.arange(self.history_size) + oldest) % self.history_size
+    s_history_flat = s_history_flat[order]
+    y_history_flat = y_history_flat[order]
+
     # Construct the limited-memory BFGS matrix from [1], section 3.
     w_flat = jnp.transpose(
         jnp.concatenate([y_history_flat, state.theta * s_history_flat], axis=0))
@@ -460,9 +479,19 @@ class LBFGSB(base.IterativeSolver):
         w_flat,
         m,
         active_ind,
+        m_inv=m_inv,
     )
 
-    descent_direction = _split_and_pack_like(x_subspace_min - x_flat, params)
+    direction_flat = x_subspace_min - x_flat
+    directional_derivative = jnp.dot(g_flat, direction_flat)
+    invalid_direction = (~jnp.isfinite(directional_derivative) |
+                         (directional_derivative >= 0.))
+    # An unreliable compact solve must not send an uphill/NaN direction into
+    # line search. Projected gradient is feasible and downhill whenever the
+    # projected-gradient stopping criterion is nonzero.
+    fallback = jnp.clip(x_flat - g_flat, lower_flat, upper_flat) - x_flat
+    direction_flat = jnp.where(invalid_direction, fallback, direction_flat)
+    descent_direction = _split_and_pack_like(direction_flat, params)
 
     use_linesearch = (not isinstance(self.stepsize, Callable) and
                       self.stepsize <= 0.)
@@ -517,24 +546,35 @@ class LBFGSB(base.IterativeSolver):
     else:
       gamma_inv = jnp.ones([], dtype=curvature.dtype)
 
-    history_ind = state.num_updates % self.history_size
+    # Always discard a model that generated a non-descent candidate. Failed
+    # line-search recovery is opt-in: always resetting can slow float32
+    # backtracking solves. A successful fallback may seed a fresh history pair.
+    reset_failed = self.reset_if_linesearch_fails & failed_linesearch
+    reset_history = invalid_direction | reset_failed
+    s_history = tree_map(
+        lambda h: jnp.where(reset_history, jnp.zeros_like(h), h), state.s_history)
+    y_history = tree_map(
+        lambda h: jnp.where(reset_history, jnp.zeros_like(h), h), state.y_history)
+    num_updates = jnp.where(reset_history, 0, state.num_updates)
+    theta = jnp.where(reset_history, self.theta, state.theta)
+    history_ind = num_updates % self.history_size
     (new_s_history, new_y_history, new_theta, new_num_updates) = (
         jax.lax.cond(
-            curvature > 0.0,
+            (curvature > 0.0) & jnp.isfinite(gamma_inv) & ~reset_failed,
             lambda sh, yh: (  # pylint: disable=g-long-lambda
                 update_history(sh, s, history_ind),
                 update_history(yh, y, history_ind),
                 gamma_inv * self.theta,
-                state.num_updates + 1,
+                num_updates + 1,
             ),
             lambda sh, yh: (  # pylint: disable=g-long-lambda
                 sh,
                 yh,
-                state.theta,
-                state.num_updates,
+                theta,
+                num_updates,
             ),
-            state.s_history,
-            state.y_history,
+            s_history,
+            y_history,
         )
     )
 

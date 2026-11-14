@@ -78,6 +78,33 @@ class LbfgsbTest(test_util.JaxoptTestCase):
 
     self.assertArraysAllClose(x1, x2, atol=5e-5)
 
+  def test_stall_detection_stops_and_preserves_diagnostics(self):
+    fun = lambda x: jnp.sum((x - 3.0) ** 2)
+    solver = LBFGSB(fun=fun, maxiter=50, tol=0.0, stepsize=1e-20,
+                    stall_iterations=3, stall_tol=1e-12,
+                    stop_if_stalled=True)
+    sol = solver.run(jnp.zeros(2),
+                     bounds=(jnp.full(2, -10.0), jnp.full(2, 10.0)))
+
+    self.assertTrue(bool(sol.state.stalled))
+    self.assertEqual(int(sol.state.stall_count), 3)
+    self.assertEqual(int(sol.state.iter_num), 3)
+    self.assertGreater(float(sol.state.error), 0.0)
+
+  @parameterized.parameters(True, False)
+  def test_stall_detection_does_not_change_converged_result(self, jit):
+    fun = lambda x: jnp.sum((x - jnp.array([1.0, -2.0])) ** 2)
+    bounds = (jnp.array([-5.0, -5.0]), jnp.array([5.0, 5.0]))
+    common = dict(fun=fun, maxiter=100, tol=1e-6, jit=jit)
+    reference = LBFGSB(**common).run(jnp.zeros(2), bounds)
+    monitored = LBFGSB(**common, stall_iterations=5, stall_tol=1e-14,
+                       stall_rtol=1e-14).run(jnp.zeros(2), bounds)
+
+    self.assertArraysAllClose(reference.params, monitored.params, atol=1e-6)
+    self.assertArraysAllClose(reference.state.value, monitored.state.value,
+                              atol=1e-7)
+    self.assertFalse(bool(monitored.state.stalled))
+
   @parameterized.product(
       implicit_diff=[True, False],
       linesearch=["backtracking", "zoom", "hager-zhang"],
