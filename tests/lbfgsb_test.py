@@ -105,6 +105,54 @@ class LbfgsbTest(test_util.JaxoptTestCase):
                               atol=1e-7)
     self.assertFalse(bool(monitored.state.stalled))
 
+  def test_wrapped_history_matches_chronological_newton_step(self):
+    # Four accepted pairs in a memory of three: the oldest slot has been
+    # overwritten. The search point has to match the Newton step of the three
+    # pairs that remain, in chronological order.
+    with enable_x64():
+      diag = onp.array([1.0, 3.0, 10.0, 0.4, 6.0])
+      rng = onp.random.default_rng(0)
+      raw = [rng.normal(size=5) for _ in range(4)]
+      chrono = [(s, diag * s) for s in raw]
+      physical = [chrono[3], chrono[1], chrono[2]]
+      grad = jnp.array(diag * onp.array([0.2, -0.4, 0.1, 0.5, -0.3]))
+      x0 = jnp.zeros(5)
+      bounds = (jnp.full(5, -100.0), jnp.full(5, 100.0))
+
+      def fun(z):
+        return 0.5 * jnp.dot(jnp.asarray(diag), z**2)
+
+      solver = LBFGSB(fun=fun, history_size=3, theta=1.0, stepsize=1.0,
+                      use_gamma=False, tol=0.0, maxiter=1)
+      state = solver.init_state(x0, bounds)
+      for index, (step_s, step_y) in enumerate(physical):
+        state = state._replace(
+            s_history=state.s_history.at[index].set(jnp.asarray(step_s)),
+            y_history=state.y_history.at[index].set(jnp.asarray(step_y)))
+      state = state._replace(num_updates=jnp.asarray(4),
+                             theta=jnp.asarray(1.0),
+                             grad=grad,
+                             value=fun(x0))
+      params = solver.update(x0, state, bounds).params
+
+      remain = chrono[1:]
+      s = onp.stack([pair[0] for pair in remain], axis=1)
+      y = onp.stack([pair[1] for pair in remain], axis=1)
+      sty = s.T @ y
+      lower = onp.tril(sty, -1)
+      matrix = onp.block([
+          [-onp.diag(onp.diag(sty)), lower.T],
+          [lower, s.T @ s],
+      ])
+      basis = onp.concatenate([y, s], axis=1)
+
+      def apply_b(vector):
+        return vector - basis @ onp.linalg.solve(matrix, basis.T @ vector)
+
+      dense = onp.column_stack([apply_b(onp.eye(5)[:, i]) for i in range(5)])
+      reference = -onp.linalg.solve(dense, onp.asarray(grad))
+      self.assertLess(onp.linalg.norm(onp.asarray(params) - reference), 1e-8)
+
   @parameterized.product(
       implicit_diff=[True, False],
       linesearch=["backtracking", "zoom", "hager-zhang"],
