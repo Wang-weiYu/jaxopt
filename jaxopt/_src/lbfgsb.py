@@ -76,6 +76,16 @@ def _get_error(x: Any, grad: Any, lower: Any, upper: Any):
   return tree_inf_norm(err)
 
 
+def _factor_compact(m_inv):
+  """Factor the compact middle matrix from equation 3.4 of [1]."""
+  return jax.scipy.linalg.lu_factor(m_inv, check_finite=False)
+
+
+def _apply_compact_inverse(factors, vec):
+  """Apply the inverse of the compact middle matrix without forming it."""
+  return jax.scipy.linalg.lu_solve(factors, vec, check_finite=False)
+
+
 def _find_cauchy_point(
     x: jnp.ndarray,
     grad: jnp.ndarray,
@@ -83,7 +93,7 @@ def _find_cauchy_point(
     upper: jnp.ndarray,
     theta: jnp.ndarray,
     w: jnp.ndarray,
-    m: jnp.ndarray,
+    m_inv: jnp.ndarray,
 ):
   """Finds the Cauchy point.
 
@@ -100,8 +110,8 @@ def _find_cauchy_point(
       approximation.
     w: `W_k` matrix in equation 3.3 of [1], computed from the correction
       matrices.
-    m: `M_k` matrix in equation 3.4 of [1], computed from the correction
-      matrices.
+    m_inv: compact middle matrix in equation 3.4 of [1], before inversion.
+      Products with its inverse are applied by a linear solve.
 
   Returns:
     x_cauchy: The Cauchy point.
@@ -130,10 +140,12 @@ def _find_cauchy_point(
                        jnp.ones([1]).astype(jnp.bool_)],
                       axis=0))
 
-  init_c = jnp.zeros(m.shape[-1:], dtype=m.dtype)
+  factors = _factor_compact(m_inv)
+  init_c = jnp.zeros(m_inv.shape[-1:], dtype=m_inv.dtype)
   init_p = jnp.dot(w.T, d)
   init_df = -jnp.dot(d, d)
-  init_ddf = -theta * init_df - jnp.dot(jnp.matmul(m, init_p), init_p)
+  init_ddf = -theta * init_df - jnp.dot(
+      _apply_compact_inverse(factors, init_p), init_p)
   init_state = (start_ind, init_df, init_ddf, active_set_mask_sorted, init_c,
                 init_p)
 
@@ -149,24 +161,25 @@ def _find_cauchy_point(
         + dt[i] * ddf
         + grad[j] ** 2
         + theta * grad[j] * (x_bound[j] - x[j])
-        - grad[j] * jnp.dot(w[j], jnp.matmul(m, c_new))
+        - grad[j] * jnp.dot(w[j], _apply_compact_inverse(factors, c_new))
     )
     ddf_new = (
         ddf
         - theta * grad[j] ** 2
-        - 2.0 * grad[j] * jnp.dot(w[j], jnp.matmul(m, p))
-        - grad[j] ** 2 * jnp.dot(w[j], jnp.matmul(m, w[j]))
+        - 2.0 * grad[j] * jnp.dot(w[j], _apply_compact_inverse(factors, p))
+        - grad[j] ** 2 * jnp.dot(
+            w[j], _apply_compact_inverse(factors, w[j]))
     )
     ddf_new = jnp.maximum(eps, ddf_new)
     p_new = p + grad[j] * w[j]
     return (i + 1, df_new, ddf_new, mask.at[i].set(False), c_new, p_new)
 
   i, df, ddf, mask_sorted, c, p = jax.lax.while_loop(_cond, _body, init_state)
-  dt_min = jnp.maximum(-df / ddf, jnp.zeros([], dtype=m.dtype))
-  dt_min = jnp.where(jnp.isnan(dt_min), jnp.zeros([], dtype=m.dtype), dt_min)
+  dt_min = jnp.maximum(-df / ddf, jnp.zeros([], dtype=m_inv.dtype))
+  dt_min = jnp.where(jnp.isnan(dt_min), jnp.zeros([], dtype=m_inv.dtype), dt_min)
   t_old = (
       jax.lax.cond(
-          i > 0, lambda: t_sorted[i - 1], lambda: jnp.zeros([], dtype=m.dtype)
+          i > 0, lambda: t_sorted[i - 1], lambda: jnp.zeros([], dtype=m_inv.dtype)
       )
       + dt_min
   )
@@ -176,14 +189,15 @@ def _find_cauchy_point(
 
 
 def _minimize_subspace(
-    x, grad, lower, upper, x_cauchy, c, theta, w, m, active_set_mask,
-    m_inv=None,
+    x, grad, lower, upper, x_cauchy, c, theta, w, m_inv, active_set_mask,
 ):
   """Direct primal method of subspace minimization from [1]."""
   w_masked = w * active_set_mask[:, jnp.newaxis].astype(w.dtype)
+  # eq. 5.4, with M^{-1} c applied by a solve against the compact matrix.
   r_c = (
-      grad + theta * (x_cauchy - x) - jnp.dot(w_masked, jnp.matmul(m, c))
-  )  # eq. 5.4
+      grad + theta * (x_cauchy - x) - jnp.dot(
+          w_masked, _apply_compact_inverse(_factor_compact(m_inv), c))
+  )
 
   # TODO(emilyaf): Implement the method from [1] for a large number of variables
   # and few active constraints.
@@ -191,8 +205,6 @@ def _minimize_subspace(
   # Use the latter without explicitly left-preconditioning by M: forming
   # I - M A can amplify inversion error and destroy a descent direction.
   # update() supplies the original compact matrix, before inversion.
-  if m_inv is None:
-    m_inv = jnp.linalg.inv(m)
   n = m_inv - jnp.matmul(w_masked.T, w_masked) / theta
   v = jnp.linalg.solve(n, jnp.dot(w_masked.T, r_c))
   du = -r_c / theta - jnp.matmul(w_masked, v) / theta**2
@@ -225,6 +237,8 @@ class LbfgsbState(NamedTuple):
   num_fun_eval: int = 0
   num_grad_eval: int = 0
   num_linesearch_iter: int = 0
+  stalled: bool = False
+  stall_count: int = 0
 
 
 @dataclasses.dataclass(eq=False)
@@ -262,6 +276,16 @@ class LBFGSB(base.IterativeSolver):
       failed line search. Default False preserves the existing recovery policy;
       set True to retry the next iteration with a fresh model. This has no
       effect if stop_if_linesearch_fails terminates the solve.
+    stall_iterations: consecutive iterations with no meaningful objective
+      change required before ``state.stalled`` is set. Zero disables stall
+      monitoring.
+    stall_tol: absolute objective change treated as no progress.
+    stall_rtol: relative objective change treated as no progress. A step makes
+      no progress when its change is at most
+      ``stall_tol + stall_rtol * max(|f|, |f_new|)``.
+    stop_if_stalled: whether to stop after ``stall_iterations`` consecutive
+      steps without progress. Default False records the stall and keeps
+      iterating.
     condition: Deprecated. Condition used to select the stepsize when using
       backtracking linesearch
     maxls: maximum number of iterations to use in the line search.
@@ -317,13 +341,20 @@ class LBFGSB(base.IterativeSolver):
   verbose: Union[bool, int] = False
   # Append new options to preserve the positional constructor signature.
   reset_if_linesearch_fails: bool = False
+  stall_iterations: int = 0
+  stall_tol: float = 0.0
+  stall_rtol: float = 0.0
+  stop_if_stalled: bool = False
 
   def _cond_fun(self, inputs):
     _, state = inputs[0]
     # We continue the optimization loop while the error tolerance is not met
     # and either failed linesearch is disallowed or linesearch hasn't failed.
-    return (state.error > self.tol) & jnp.logical_or(
-        not self.stop_if_linesearch_fails, ~state.failed_linesearch)
+    return (
+        (state.error > self.tol)
+        & jnp.logical_or(not self.stop_if_linesearch_fails,
+                         ~state.failed_linesearch)
+        & jnp.logical_or(not self.stop_if_stalled, ~state.stalled))
 
   def init_state(
       self,
@@ -352,6 +383,8 @@ class LBFGSB(base.IterativeSolver):
           stepsize=init_params.state.stepsize,
           num_updates=init_params.state.num_updates,
           theta=init_params.state.theta,
+          stalled=init_params.state.stalled,
+          stall_count=init_params.state.stall_count,
       )
       init_params = init_params.params
       dtype = tree_single_dtype(init_params)
@@ -364,6 +397,8 @@ class LBFGSB(base.IterativeSolver):
           stepsize=jnp.asarray(self.max_stepsize, dtype=dtype),
           num_updates=jnp.asarray(0),
           theta=jnp.asarray(self.theta, dtype=dtype),
+          stalled=jnp.asarray(False),
+          stall_count=jnp.asarray(0),
       )
 
     (value, aux), grad = self._value_and_grad_with_aux(
@@ -433,10 +468,10 @@ class LBFGSB(base.IterativeSolver):
     s_dot_yt = jnp.matmul(s_history_flat, jnp.transpose(y_history_flat))
 
     # Pad extra history dimensions with constants on the diagonal to ensure
-    # invertability while maintaining constant array sizes for JIT compilation.
-    # The corresponding dimensions of the inverted matrix are multiplied by zero
-    # downstream. If possible, the constants are chosen to equal an existing
-    # nonzero element of the diagonal, for numerical stability.
+    # invertibility while maintaining constant array sizes for JIT compilation.
+    # Unused columns of W are zero, so those coordinates do not contribute to
+    # the compact products. If possible, the constants are chosen to equal an
+    # existing nonzero element of the diagonal, for numerical stability.
     history_mask = jnp.arange(self.history_size) >= state.num_updates
     diagonal_ones = history_mask.astype(x_flat.dtype)
     i, j = jnp.diag_indices(self.history_size)
@@ -463,10 +498,8 @@ class LBFGSB(base.IterativeSolver):
                             axis=1)
         ],
         axis=0)
-    m = jnp.linalg.inv(m_inv)
-
     x_cauchy, c, active_ind = _find_cauchy_point(
-        x_flat, g_flat, lower_flat, upper_flat, state.theta, w_flat, m
+        x_flat, g_flat, lower_flat, upper_flat, state.theta, w_flat, m_inv
     )
     x_subspace_min = _minimize_subspace(
         x_flat,
@@ -477,9 +510,8 @@ class LBFGSB(base.IterativeSolver):
         c,
         state.theta,
         w_flat,
-        m,
+        m_inv,
         active_ind,
-        m_inv=m_inv,
     )
 
     direction_flat = x_subspace_min - x_flat
@@ -579,6 +611,18 @@ class LBFGSB(base.IterativeSolver):
     )
 
     error = _get_error(new_params, new_grad, lower, upper)
+    # stall_iterations == 0 leaves the historical stopping rules unchanged.
+    value_change = jnp.abs(new_value - state.value)
+    change_scale = jnp.maximum(jnp.abs(state.value), jnp.abs(new_value))
+    no_progress = value_change <= (
+        jnp.asarray(self.stall_tol, dtype=value_change.dtype)
+        + jnp.asarray(self.stall_rtol, dtype=value_change.dtype) * change_scale)
+    stall_count = jnp.where(no_progress, state.stall_count + 1,
+                            jnp.zeros_like(state.stall_count))
+    monitoring = jnp.asarray(self.stall_iterations > 0)
+    stall_count = jnp.where(monitoring, stall_count,
+                            jnp.zeros_like(stall_count))
+    stalled = monitoring & (stall_count >= self.stall_iterations)
     new_state = LbfgsbState(
         iter_num=state.iter_num + 1,
         value=new_value,
@@ -594,6 +638,8 @@ class LBFGSB(base.IterativeSolver):
         num_grad_eval=new_num_grad_eval,
         num_fun_eval=new_num_fun_eval,
         num_linesearch_iter=new_num_linesearch_iter,
+        stalled=stalled,
+        stall_count=stall_count,
     )
 
     if self.verbose:
